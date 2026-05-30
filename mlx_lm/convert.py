@@ -82,6 +82,46 @@ QUANT_RECIPES = ["mixed_2_6", "mixed_3_4", "mixed_3_6", "mixed_4_6"]
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 
+def _resolve_config_dtype(config):
+    candidates = [
+        config.get("torch_dtype", None),
+        config.get("dtype", None),
+    ]
+    if text_config := config.get("text_config", None):
+        candidates.extend(
+            [
+                text_config.get("dtype", None),
+                text_config.get("torch_dtype", None),
+            ]
+        )
+    if decoder_config := config.get("decoder", None):
+        candidates.extend(
+            [
+                decoder_config.get("dtype", None),
+                decoder_config.get("torch_dtype", None),
+            ]
+        )
+    if encoder_config := config.get("encoder", None):
+        candidates.extend(
+            [
+                encoder_config.get("dtype", None),
+                encoder_config.get("torch_dtype", None),
+            ]
+        )
+        if encoder_text_config := encoder_config.get("text_config", None):
+            candidates.extend(
+                [
+                    encoder_text_config.get("dtype", None),
+                    encoder_text_config.get("torch_dtype", None),
+                ]
+            )
+
+    for candidate in candidates:
+        if candidate is not None:
+            return candidate.replace("torch.", "")
+    return None
+
+
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
@@ -127,9 +167,7 @@ def convert(
         )
 
     if dtype is None:
-        dtype = config.get("torch_dtype", None)
-    if dtype is None and (text_config := config.get("text_config", None)):
-        dtype = text_config.get("dtype", None)
+        dtype = _resolve_config_dtype(config)
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
         dtype = getattr(mx, dtype)

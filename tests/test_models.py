@@ -1461,6 +1461,174 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_t5gemma2_text_seq2seq(self):
+        from mlx_lm.models import t5gemma2
+
+        config = {
+            "model_type": "t5gemma2",
+            "vocab_size": 128,
+            "eoi_token_index": 9,
+            "encoder": {
+                "text_config": {
+                    "hidden_size": 32,
+                    "num_hidden_layers": 2,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "sliding_window": 4,
+                    "layer_types": ["sliding_attention", "full_attention"],
+                    "max_position_embeddings": 32,
+                }
+            },
+            "decoder": {
+                "hidden_size": 32,
+                "num_hidden_layers": 2,
+                "intermediate_size": 64,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "sliding_window": 4,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "max_position_embeddings": 32,
+            },
+        }
+        args = t5gemma2.ModelArgs.from_dict(config)
+        model = t5gemma2.Model(args)
+
+        source = mx.array([[4, 5, 6]])
+        decoder_inputs = mx.array([[2, 7]])
+        logits = model(source, decoder_inputs=decoder_inputs)
+        self.assertEqual(logits.shape, (1, 2, config["vocab_size"]))
+
+        encoder_outputs = model.encode(source)
+        cache = model.make_cache()
+        step_1 = model.decode(mx.array([[2]]), encoder_outputs, cache=cache)
+        step_2 = model.decode(mx.array([[7]]), encoder_outputs, cache=cache)
+        self.assertEqual(step_1.shape, (1, 1, config["vocab_size"]))
+        self.assertEqual(step_2.shape, (1, 1, config["vocab_size"]))
+        self.assertEqual(cache[0][0].offset, 2)
+        self.assertEqual(cache[0][1].offset, source.shape[1])
+
+    def test_t5gemma2_sanitize_text_only_weights(self):
+        from mlx_lm.models import t5gemma2
+
+        model = t5gemma2.Model(
+            t5gemma2.ModelArgs.from_dict(
+                {
+                    "vocab_size": 8,
+                    "encoder": {
+                        "text_config": {
+                            "hidden_size": 4,
+                            "num_hidden_layers": 1,
+                            "intermediate_size": 8,
+                            "num_attention_heads": 1,
+                            "num_key_value_heads": 1,
+                            "head_dim": 4,
+                            "layer_types": ["full_attention"],
+                        }
+                    },
+                    "decoder": {
+                        "hidden_size": 4,
+                        "num_hidden_layers": 1,
+                        "intermediate_size": 8,
+                        "num_attention_heads": 1,
+                        "num_key_value_heads": 1,
+                        "head_dim": 4,
+                        "layer_types": ["full_attention"],
+                    },
+                }
+            )
+        )
+        embed = mx.ones((8, 4))
+        eoi = mx.ones((4,))
+        weights = {
+            "model.encoder.text_model.embed_tokens.weight": embed,
+            "model.encoder.text_model.embed_tokens.eoi_embedding": eoi,
+            "model.encoder.vision_tower.embeddings.patch_embedding.weight": mx.ones(
+                (1,)
+            ),
+            "model.encoder.multi_modal_projector.mm_input_projection_weight": mx.ones(
+                (1,)
+            ),
+            "model.decoder.layers.0.self_attn.q_proj.weight": mx.ones((4, 4)),
+            "lm_head.out_proj.weight": mx.ones((8, 4)),
+            "model.decoder.rotary_emb.full_attention_inv_freq": mx.ones((4,)),
+        }
+
+        sanitized = model.sanitize(weights)
+        self.assertIn("encoder.embed_tokens.weight", sanitized)
+        self.assertIn("decoder.embed_tokens.weight", sanitized)
+        self.assertIn("decoder.layers.0.self_attn.q_proj.weight", sanitized)
+        self.assertNotIn("encoder.vision_tower.embeddings.patch_embedding.weight", sanitized)
+        self.assertNotIn(
+            "encoder.multi_modal_projector.mm_input_projection_weight",
+            sanitized,
+        )
+        self.assertNotIn("lm_head.out_proj.weight", sanitized)
+        self.assertNotIn("decoder.rotary_emb.full_attention_inv_freq", sanitized)
+        self.assertTrue(
+            mx.array_equal(sanitized["decoder.embed_tokens.weight"], embed)
+        )
+
+    def test_t5gemma2_generate_step(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models import t5gemma2
+
+        config = {
+            "model_type": "t5gemma2",
+            "vocab_size": 32,
+            "encoder": {
+                "text_config": {
+                    "hidden_size": 16,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "layer_types": ["full_attention"],
+                }
+            },
+            "decoder": {
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "intermediate_size": 32,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "layer_types": ["full_attention"],
+            },
+        }
+        model = t5gemma2.Model(t5gemma2.ModelArgs.from_dict(config))
+        generated = list(generate_step(mx.array([4, 5]), model, max_tokens=2))
+
+        self.assertEqual(len(generated), 2)
+        self.assertEqual(generated[0][1].shape, (config["vocab_size"],))
+
+    def test_t5gemma2_convert_resolves_nested_dtype(self):
+        from mlx_lm.convert import _resolve_config_dtype
+
+        self.assertEqual(
+            _resolve_config_dtype(
+                {
+                    "model_type": "t5gemma2",
+                    "encoder": {"text_config": {"dtype": "bfloat16"}},
+                    "decoder": {"dtype": "float16"},
+                }
+            ),
+            "float16",
+        )
+        self.assertEqual(
+            _resolve_config_dtype(
+                {
+                    "model_type": "t5gemma2",
+                    "dtype": "bfloat16",
+                    "decoder": {"dtype": "float16"},
+                }
+            ),
+            "bfloat16",
+        )
+
     def test_gemma4_text(self):
         from mlx_lm.models import gemma4_text
 
