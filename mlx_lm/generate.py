@@ -322,6 +322,11 @@ def _encoder_decoder_generate_step(
     if max_kv_size is not None:
         raise NotImplementedError("max_kv_size is not supported for encoder-decoder models.")
 
+    if kv_bits is not None:
+        raise NotImplementedError(
+            "KV cache quantization is not supported for encoder-decoder models."
+        )
+
     if prompt_cache is not None:
         raise ValueError(
             "Prompt caches are not supported for encoder-decoder models."
@@ -378,7 +383,7 @@ def _encoder_decoder_generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
-    y = mx.array([getattr(model, "bos_token_id", 2)], dtype=prompt.dtype)
+    y = mx.array([getattr(model, "bos_token_id", 2)], dtype=mx.int32)
     y, logprobs = _step(y)
     mx.async_eval(y, logprobs)
 

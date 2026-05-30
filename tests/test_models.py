@@ -1646,6 +1646,85 @@ class TestModels(unittest.TestCase):
         self.assertEqual(len(generated), 2)
         self.assertEqual(generated[0][1].shape, (config["vocab_size"],))
 
+    def test_t5gemma2_generate_step_empty_prompt_with_input_embeddings(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models import t5gemma2
+
+        config = {
+            "model_type": "t5gemma2",
+            "vocab_size": 32,
+            "encoder": {
+                "text_config": {
+                    "hidden_size": 16,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "layer_types": ["full_attention"],
+                }
+            },
+            "decoder": {
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "intermediate_size": 32,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "layer_types": ["full_attention"],
+            },
+        }
+        model = t5gemma2.Model(t5gemma2.ModelArgs.from_dict(config))
+        input_embeddings = model.encoder.embed_tokens(mx.array([4, 5]))
+
+        generated = list(
+            generate_step(
+                mx.array([], dtype=mx.float32),
+                model,
+                max_tokens=1,
+                input_embeddings=input_embeddings,
+            )
+        )
+
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(generated[0][1].shape, (config["vocab_size"],))
+
+    def test_t5gemma2_rejects_kv_bits_generation(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models import t5gemma2
+
+        config = {
+            "model_type": "t5gemma2",
+            "vocab_size": 32,
+            "encoder": {
+                "text_config": {
+                    "hidden_size": 16,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "layer_types": ["full_attention"],
+                }
+            },
+            "decoder": {
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "intermediate_size": 32,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "layer_types": ["full_attention"],
+            },
+        }
+        model = t5gemma2.Model(t5gemma2.ModelArgs.from_dict(config))
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "KV cache quantization.*encoder-decoder models",
+        ):
+            list(generate_step(mx.array([4, 5]), model, max_tokens=1, kv_bits=4))
+
     def test_t5gemma2_rejects_prompt_cache_generation(self):
         from mlx_lm.generate import generate_step
         from mlx_lm.models import t5gemma2
