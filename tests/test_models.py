@@ -1571,6 +1571,47 @@ class TestModels(unittest.TestCase):
             mx.array_equal(sanitized["decoder.embed_tokens.weight"], embed)
         )
 
+    def test_t5gemma2_quantization_skips_encoder_linears(self):
+        from mlx_lm.models import t5gemma2
+        from mlx_lm.utils import quantize_model
+
+        model = t5gemma2.Model(
+            t5gemma2.ModelArgs.from_dict(
+                {
+                    "vocab_size": 32,
+                    "encoder": {
+                        "text_config": {
+                            "hidden_size": 32,
+                            "num_hidden_layers": 1,
+                            "intermediate_size": 64,
+                            "num_attention_heads": 2,
+                            "num_key_value_heads": 1,
+                            "head_dim": 16,
+                            "layer_types": ["full_attention"],
+                        }
+                    },
+                    "decoder": {
+                        "hidden_size": 32,
+                        "num_hidden_layers": 1,
+                        "intermediate_size": 64,
+                        "num_attention_heads": 2,
+                        "num_key_value_heads": 1,
+                        "head_dim": 16,
+                        "layer_types": ["full_attention"],
+                    },
+                }
+            )
+        )
+
+        quantize_model(model, {}, 32, 8)
+
+        self.assertIsInstance(model.encoder.layers[0].self_attn.q_proj, nn.Linear)
+        self.assertIsInstance(model.encoder.layers[0].mlp.up_proj, nn.Linear)
+        self.assertIsInstance(model.decoder.layers[0].self_attn.q_proj, nn.QuantizedLinear)
+        self.assertIsInstance(model.decoder.layers[0].mlp.up_proj, nn.QuantizedLinear)
+        self.assertIsInstance(model.encoder.embed_tokens, t5gemma2.ScaledEmbedding)
+        self.assertIsInstance(model.decoder.embed_tokens, t5gemma2.ScaledEmbedding)
+
     def test_t5gemma2_generate_step(self):
         from mlx_lm.generate import generate_step
         from mlx_lm.models import t5gemma2
@@ -1605,6 +1646,82 @@ class TestModels(unittest.TestCase):
         self.assertEqual(len(generated), 2)
         self.assertEqual(generated[0][1].shape, (config["vocab_size"],))
 
+    def test_t5gemma2_rejects_prompt_cache_generation(self):
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models import t5gemma2
+
+        config = {
+            "model_type": "t5gemma2",
+            "vocab_size": 32,
+            "encoder": {
+                "text_config": {
+                    "hidden_size": 16,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "layer_types": ["full_attention"],
+                }
+            },
+            "decoder": {
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "intermediate_size": 32,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "layer_types": ["full_attention"],
+            },
+        }
+        model = t5gemma2.Model(t5gemma2.ModelArgs.from_dict(config))
+
+        with self.assertRaisesRegex(ValueError, "Prompt caches are not supported"):
+            list(
+                generate_step(
+                    mx.array([4, 5]),
+                    model,
+                    max_tokens=1,
+                    prompt_cache=model.make_cache(),
+                )
+            )
+
+    def test_t5gemma2_rejects_batch_generation(self):
+        from mlx_lm.generate import BatchGenerator
+        from mlx_lm.models import t5gemma2
+
+        config = {
+            "model_type": "t5gemma2",
+            "vocab_size": 32,
+            "encoder": {
+                "text_config": {
+                    "hidden_size": 16,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "layer_types": ["full_attention"],
+                }
+            },
+            "decoder": {
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "intermediate_size": 32,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "layer_types": ["full_attention"],
+            },
+        }
+        model = t5gemma2.Model(t5gemma2.ModelArgs.from_dict(config))
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "Batch generation is not supported",
+        ):
+            BatchGenerator(model)
+
     def test_t5gemma2_convert_resolves_nested_dtype(self):
         from mlx_lm.convert import _resolve_config_dtype
 
@@ -1628,6 +1745,104 @@ class TestModels(unittest.TestCase):
             ),
             "bfloat16",
         )
+
+    def test_t5gemma2_collection_variant_configs(self):
+        from mlx_lm.models import t5gemma2
+
+        variants = {
+            "270m": {
+                "hidden_size": 640,
+                "num_hidden_layers": 18,
+                "intermediate_size": 2048,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "sliding_window": 512,
+                "max_position_embeddings": 32768,
+            },
+            "1b": {
+                "hidden_size": 1152,
+                "num_hidden_layers": 26,
+                "intermediate_size": 6912,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "sliding_window": 512,
+                "max_position_embeddings": 32768,
+            },
+            "4b": {
+                "hidden_size": 2560,
+                "num_hidden_layers": 34,
+                "intermediate_size": 10240,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "sliding_window": 1024,
+                "max_position_embeddings": 131072,
+            },
+        }
+
+        for params in variants.values():
+            with self.subTest(params=params):
+                text_config = {
+                    **params,
+                    "head_dim": 256,
+                    "query_pre_attn_scalar": 256,
+                    "layer_types": [
+                        "sliding_attention"
+                        if (i + 1) % 6
+                        else "full_attention"
+                        for i in range(params["num_hidden_layers"])
+                    ],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "factor": 8.0,
+                            "rope_theta": 1000000,
+                            "rope_type": "linear",
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000,
+                            "rope_type": "default",
+                        },
+                    },
+                }
+                args = t5gemma2.ModelArgs.from_dict(
+                    {
+                        "model_type": "t5gemma2",
+                        "vocab_size": 262144,
+                        "eoi_token_index": 256000,
+                        "encoder": {"text_config": text_config},
+                        "decoder": text_config,
+                    }
+                )
+                encoder_args = t5gemma2.TextArgs.from_dict(
+                    args.encoder_text_config
+                )
+                decoder_args = t5gemma2.TextArgs.from_dict(args.decoder_config)
+
+                self.assertEqual(encoder_args.hidden_size, params["hidden_size"])
+                self.assertEqual(decoder_args.hidden_size, params["hidden_size"])
+                self.assertEqual(
+                    encoder_args.num_hidden_layers,
+                    params["num_hidden_layers"],
+                )
+                self.assertEqual(
+                    decoder_args.num_hidden_layers,
+                    params["num_hidden_layers"],
+                )
+                self.assertEqual(
+                    encoder_args.num_key_value_heads,
+                    params["num_key_value_heads"],
+                )
+                self.assertEqual(
+                    decoder_args.num_key_value_heads,
+                    params["num_key_value_heads"],
+                )
+                self.assertEqual(
+                    encoder_args.sliding_window,
+                    params["sliding_window"],
+                )
+                self.assertEqual(
+                    decoder_args.max_position_embeddings,
+                    params["max_position_embeddings"],
+                )
 
     def test_gemma4_text(self):
         from mlx_lm.models import gemma4_text

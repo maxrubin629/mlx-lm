@@ -35,6 +35,44 @@ class TextDataset:
     def __len__(self):
         return len(self._data)
 
+    def __bool__(self):
+        return len(self) > 0
+
+
+def _append_eos(tokens, tokenizer: PreTrainedTokenizer):
+    tokens = list(tokens)
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is not None and (len(tokens) == 0 or tokens[-1] != eos_token_id):
+        tokens.append(eos_token_id)
+    return tokens
+
+
+class Seq2SeqTextDataset:
+    """
+    A text-to-text dataset for encoder-decoder models using {"text": ...}
+    records. The text is used as both source and target.
+    """
+
+    def __init__(
+        self,
+        data: List[Dict[str, str]],
+        tokenizer: PreTrainedTokenizer,
+        text_key: str = "text",
+    ):
+        self._data = data
+        self.tokenizer = tokenizer
+        self.text_key = text_key
+
+    def process(self, d):
+        tokens = _append_eos(self.tokenizer.encode(d[self.text_key]), self.tokenizer)
+        return (tokens, tokens)
+
+    def __getitem__(self, idx: int):
+        return self._data[idx]
+
+    def __len__(self):
+        return len(self._data)
+
 
 class ChatDataset:
     """
@@ -75,6 +113,55 @@ class ChatDataset:
             return (tokens, offset)
         else:
             return (tokens, 0)
+
+    def __getitem__(self, idx: int):
+        return self._data[idx]
+
+    def __len__(self):
+        return len(self._data)
+
+
+class Seq2SeqChatDataset:
+    """
+    A chat dataset for encoder-decoder models. The source is the conversation
+    up to the final assistant message; the target is the final assistant text.
+    """
+
+    def __init__(
+        self,
+        data: List[Dict[str, str]],
+        tokenizer: PreTrainedTokenizer,
+        chat_key: str = "messages",
+    ):
+        self._data = data
+        self.chat_key = chat_key
+        self.tokenizer = tokenizer
+
+    def process(self, d):
+        messages = d[self.chat_key]
+        if messages[-1].get("role") != "assistant":
+            raise ValueError(
+                "Seq2seq chat fine-tuning expects the final message to be from "
+                "the assistant."
+            )
+        tools = d.get("tools", None)
+        source = self.tokenizer.apply_chat_template(
+            messages[:-1],
+            tools=tools,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+        assistant_message = messages[-1]
+        if assistant_message.get("content") is not None:
+            target = self.tokenizer.encode(assistant_message["content"])
+        else:
+            target = self.tokenizer.apply_chat_template(
+                [assistant_message],
+                tools=tools,
+                return_dict=False,
+            )
+        target = _append_eos(target, self.tokenizer)
+        return (source, target)
 
     def __getitem__(self, idx: int):
         return self._data[idx]
@@ -133,6 +220,39 @@ class CompletionsDataset:
         return len(self._data)
 
 
+class Seq2SeqCompletionsDataset:
+    """
+    A prompt-completion dataset for encoder-decoder models. The prompt is
+    encoded as the source sequence and the completion as the decoder target.
+    """
+
+    def __init__(
+        self,
+        data: List[Dict[str, str]],
+        tokenizer: PreTrainedTokenizer,
+        prompt_key: str,
+        completion_key: str,
+    ):
+        self._data = data
+        self.prompt_key = prompt_key
+        self.completion_key = completion_key
+        self.tokenizer = tokenizer
+
+    def process(self, d):
+        source = _append_eos(self.tokenizer.encode(d[self.prompt_key]), self.tokenizer)
+        target = _append_eos(
+            self.tokenizer.encode(d[self.completion_key]),
+            self.tokenizer,
+        )
+        return (source, target)
+
+    def __getitem__(self, idx: int):
+        return self._data[idx]
+
+    def __len__(self):
+        return len(self._data)
+
+
 class ConcatenatedDataset:
     def __init__(self, data: List[Any]):
         self._data = data
@@ -161,7 +281,10 @@ class CacheDataset:
         self._proc_data = [None] * len(data)
 
     def itemlen(self, idx: int):
-        return len(self._data[idx])
+        item = self[idx]
+        if len(item) == 2 and isinstance(item[1], (list, tuple)):
+            return len(item[0]) + len(item[1])
+        return len(item[0])
 
     def __getitem__(self, idx: int):
         if self._proc_data[idx] is None:
@@ -170,6 +293,9 @@ class CacheDataset:
 
     def __len__(self):
         return len(self._data)
+
+    def __bool__(self):
+        return len(self) > 0
 
 
 def create_dataset(
@@ -182,16 +308,28 @@ def create_dataset(
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
     chat_feature = getattr(config, "chat_feature", "messages")
+    is_encoder_decoder = getattr(config, "is_encoder_decoder", False)
     sample = data[0]
     if prompt_feature in sample and completion_feature in sample:
+        if is_encoder_decoder:
+            return Seq2SeqCompletionsDataset(
+                data,
+                tokenizer,
+                prompt_feature,
+                completion_feature,
+            )
         return CompletionsDataset(
             data, tokenizer, prompt_feature, completion_feature, mask_prompt
         )
     elif chat_feature in sample:
+        if is_encoder_decoder:
+            return Seq2SeqChatDataset(data, tokenizer, chat_key=chat_feature)
         return ChatDataset(
             data, tokenizer, chat_key=chat_feature, mask_prompt=mask_prompt
         )
     elif text_feature in sample:
+        if is_encoder_decoder:
+            return Seq2SeqTextDataset(data, tokenizer, text_key=text_feature)
         if mask_prompt:
             raise ValueError("Prompt masking not supported for text dataset.")
         return TextDataset(data, tokenizer, text_key=text_feature)
@@ -266,6 +404,7 @@ def load_custom_hf_dataset(args, tokenizer: PreTrainedTokenizer):
         ds_path = ds["path"]
         print(f"Loading Hugging Face dataset {ds_path}.")
         ds["mask_prompt"] = getattr(args, "mask_prompt", False)
+        ds["is_encoder_decoder"] = getattr(args, "is_encoder_decoder", False)
         config = types.SimpleNamespace(**ds)
         hf_config = ds.get("config", {})
         if args.train:

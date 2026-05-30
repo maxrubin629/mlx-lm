@@ -217,6 +217,11 @@ def _concat_masks(self_mask, cross_mask, dtype):
         return mx.concatenate([self_mask, cross_mask], axis=-1)
     if self_mask.ndim == 2:
         self_mask = mx.expand_dims(self_mask, 0)
+    if self_mask.shape[0] == 1 and cross_mask.shape[0] != 1:
+        self_mask = mx.broadcast_to(
+            self_mask,
+            (cross_mask.shape[0], self_mask.shape[1], self_mask.shape[2]),
+        )
     return mx.concatenate([self_mask, cross_mask], axis=-1)
 
 
@@ -648,9 +653,22 @@ class Model(nn.Module):
         return self.decoder.layers
 
     @property
+    def num_tunable_layers(self):
+        return max(len(self.encoder.layers), len(self.decoder.layers))
+
+    def get_tunable_layers(self, num_layers: int):
+        if num_layers < 0:
+            num_layers = self.num_tunable_layers
+        n = max(num_layers, 0)
+        return self.encoder.layers[-n:] + self.decoder.layers[-n:]
+
+    @property
     def quant_predicate(self):
-        def predicate(_, module):
-            return not isinstance(module, ScaledEmbedding)
+        def predicate(path, module):
+            return path.startswith("decoder.") and not isinstance(
+                module,
+                ScaledEmbedding,
+            )
 
         return predicate
 

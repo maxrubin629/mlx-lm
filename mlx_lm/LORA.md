@@ -268,6 +268,10 @@ Refer to the documentation for the model you are fine-tuning for more details.
 {"prompt": "What is the capital of France?", "completion": "Paris."}
 ```
 
+For encoder-decoder models, `prompt` is encoded as the source sequence and
+`completion` is encoded as the decoder target. For decoder-only models, the
+prompt and completion continue to be formatted as a single causal sequence.
+
 For the `completions` data format, a different key can be used for the prompt
 and completion by specifying the following in the YAML config:
 

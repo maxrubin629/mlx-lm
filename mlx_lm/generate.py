@@ -322,8 +322,11 @@ def _encoder_decoder_generate_step(
     if max_kv_size is not None:
         raise NotImplementedError("max_kv_size is not supported for encoder-decoder models.")
 
-    if prompt_cache is None:
-        prompt_cache = cache.make_prompt_cache(model)
+    if prompt_cache is not None:
+        raise ValueError(
+            "Prompt caches are not supported for encoder-decoder models."
+        )
+    prompt_cache = cache.make_prompt_cache(model)
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
     quantize_cache_fn = functools.partial(
@@ -1623,6 +1626,12 @@ class BatchGenerator:
         max_kv_size: Optional[int] = None,
         stream=None,
     ):
+        self._old_wired_limit = None
+        if getattr(model, "is_encoder_decoder", False):
+            raise NotImplementedError(
+                "Batch generation is not supported for encoder-decoder models."
+            )
+
         self.model = model
         self.max_tokens = max_tokens
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -1658,8 +1667,6 @@ class BatchGenerator:
             self._old_wired_limit = mx.set_wired_limit(
                 mx.device_info()["max_recommended_working_set_size"]
             )
-        else:
-            self._old_wired_limit = None
 
     @property
     def stream(self):

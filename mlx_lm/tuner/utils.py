@@ -35,6 +35,18 @@ def build_schedule(schedule_config: Dict):
         return bound_schedule_fn
 
 
+def get_tunable_layer_count(model: nn.Module) -> int:
+    if hasattr(model, "num_tunable_layers"):
+        return model.num_tunable_layers
+    return len(model.layers)
+
+
+def get_tunable_layers(model: nn.Module, num_layers: int):
+    if hasattr(model, "get_tunable_layers"):
+        return model.get_tunable_layers(num_layers)
+    return model.layers[-max(num_layers, 0) :]
+
+
 def linear_to_lora_layers(
     model: nn.Module,
     num_layers: int,
@@ -97,10 +109,10 @@ def linear_to_lora_layers(
             if hasattr(m, "to_lora") or isinstance(m, types):
                 keys.add(p)
 
-        for l in model.layers:
+        for l in get_tunable_layers(model, -1):
             l.apply_to_modules(get_keys_for_lora)
 
-    for l in model.layers[-max(num_layers, 0) :]:
+    for l in get_tunable_layers(model, num_layers):
         lora_layers = [(k, to_lora(m)) for k, m in l.named_modules() if k in keys]
         if lora_layers:
             l.update_modules(tree_unflatten(lora_layers))

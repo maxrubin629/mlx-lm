@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
+from .utils import get_tunable_layers
 
 
 def _clear_cache(threshold: int):
@@ -99,6 +100,54 @@ def default_loss(model, batch, lengths):
     return ce, ntoks
 
 
+def seq2seq_loss(model, source, source_lengths, target, target_lengths):
+    bos = mx.full((target.shape[0], 1), model.bos_token_id, dtype=target.dtype)
+    decoder_inputs = mx.concatenate([bos, target[:, :-1]], axis=1)
+
+    source_steps = mx.arange(source.shape[1])
+    encoder_attention_mask = source_steps < source_lengths[:, None]
+
+    logits = model(
+        source,
+        decoder_inputs=decoder_inputs,
+        encoder_attention_mask=encoder_attention_mask,
+    )
+
+    target_steps = mx.arange(target.shape[1])
+    mask = target_steps < target_lengths[:, None]
+    ce = nn.losses.cross_entropy(logits, target) * mask
+    ntoks = mask.sum()
+    ce = ce.astype(mx.float32).sum() / ntoks
+
+    return ce, ntoks
+
+
+def _is_seq2seq_sample(sample):
+    return len(sample) == 2 and isinstance(sample[1], (list, tuple))
+
+
+def _pad_sequences(sequences, batch_size, max_seq_length):
+    lengths = [len(x) for x in sequences]
+    if max(lengths) > max_seq_length:
+        print(
+            f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
+            f"The longest sequence {max(lengths)} will be truncated to "
+            f"{max_seq_length}. Consider pre-splitting your data to save memory."
+        )
+
+    pad_to = 32
+    max_length_in_batch = 1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to)
+    max_length_in_batch = min(max_length_in_batch, max_seq_length)
+
+    batch_arr = np.zeros((batch_size, max_length_in_batch), np.int32)
+    for j in range(batch_size):
+        truncated_length = min(lengths[j], max_seq_length)
+        batch_arr[j, :truncated_length] = sequences[j][:truncated_length]
+        lengths[j] = truncated_length
+
+    return mx.array(batch_arr), mx.array(lengths)
+
+
 def iterate_batches(
     dataset,
     batch_size,
@@ -141,6 +190,21 @@ def iterate_batches(
         indices = np.random.permutation(len(batch_idx))
         for i in indices:
             batch = [dataset[j] for j in batch_idx[i]]
+            if _is_seq2seq_sample(batch[0]):
+                source, target = zip(*batch)
+                source, source_lengths = _pad_sequences(
+                    source,
+                    batch_size // step,
+                    max_seq_length,
+                )
+                target, target_lengths = _pad_sequences(
+                    target,
+                    batch_size // step,
+                    max_seq_length,
+                )
+                yield source, source_lengths, target, target_lengths
+                continue
+
             if len(batch[0]) == 2:
                 batch, offsets = zip(*batch)
             else:
@@ -235,7 +299,12 @@ def train(
         print(f"Node {rank} of {world_size}")
 
     if args.grad_checkpoint:
-        grad_checkpoint(model.layers[0])
+        checkpointed = set()
+        for layer in get_tunable_layers(model, -1):
+            layer_type = type(layer)
+            if layer_type not in checkpointed:
+                grad_checkpoint(layer)
+                checkpointed.add(layer_type)
 
     loss_value_and_grad = nn.value_and_grad(model, loss)
 

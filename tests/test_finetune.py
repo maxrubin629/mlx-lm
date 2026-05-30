@@ -15,8 +15,8 @@ from mlx.utils import tree_flatten
 from mlx_lm import lora, tuner
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
 from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear
-from mlx_lm.tuner.trainer import evaluate
-from mlx_lm.tuner.utils import build_schedule
+from mlx_lm.tuner.trainer import evaluate, iterate_batches, seq2seq_loss
+from mlx_lm.tuner.utils import build_schedule, get_tunable_layers
 
 
 @contextmanager
@@ -28,6 +28,39 @@ def swapped_with_identity(obj, func):
 
 
 class TestLora(unittest.TestCase):
+    def _t5gemma2_model(self):
+        from mlx_lm.models import t5gemma2
+
+        config = {
+            "model_type": "t5gemma2",
+            "vocab_size": 64,
+            "encoder": {
+                "text_config": {
+                    "hidden_size": 32,
+                    "num_hidden_layers": 2,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "sliding_window": 4,
+                    "layer_types": ["sliding_attention", "full_attention"],
+                    "max_position_embeddings": 32,
+                }
+            },
+            "decoder": {
+                "hidden_size": 32,
+                "num_hidden_layers": 2,
+                "intermediate_size": 64,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "sliding_window": 4,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "max_position_embeddings": 32,
+            },
+        }
+        return t5gemma2.Model(t5gemma2.ModelArgs.from_dict(config))
+
     def test_llama(self):
         from mlx_lm.models import llama
 
@@ -86,6 +119,184 @@ class TestLora(unittest.TestCase):
                 params["rank"] * (args.hidden_size + args.vocab_size)
             ),
         )
+
+    def test_t5gemma2_lora_converts_encoder_and_decoder_layers(self):
+        model = self._t5gemma2_model()
+        model.freeze()
+        params = {
+            "rank": 2,
+            "dropout": 0.0,
+            "scale": 1.0,
+            "keys": ["self_attn.q_proj"],
+        }
+        tuner.utils.linear_to_lora_layers(model, 1, params)
+
+        self.assertIsInstance(
+            model.encoder.layers[-1].self_attn.q_proj,
+            LoRALinear,
+        )
+        self.assertIsInstance(
+            model.decoder.layers[-1].self_attn.q_proj,
+            LoRALinear,
+        )
+        self.assertNotIsInstance(
+            model.encoder.layers[0].self_attn.q_proj,
+            LoRALinear,
+        )
+        self.assertNotIsInstance(
+            model.decoder.layers[0].self_attn.q_proj,
+            LoRALinear,
+        )
+
+    def test_t5gemma2_seq2seq_full_and_lora_gradients(self):
+        source = mx.array([[4, 5, 1], [6, 1, 0]])
+        source_lengths = mx.array([3, 2])
+        target = mx.array([[7, 8, 1], [9, 1, 0]])
+        target_lengths = mx.array([3, 2])
+
+        model = self._t5gemma2_model()
+        model.freeze()
+        for layer in get_tunable_layers(model, 1):
+            layer.unfreeze()
+        (loss, toks), grad = nn.value_and_grad(model, seq2seq_loss)(
+            model,
+            source,
+            source_lengths,
+            target,
+            target_lengths,
+        )
+        mx.eval(loss, toks, grad)
+        self.assertTrue(bool(mx.isfinite(loss).item()))
+        self.assertEqual(toks.item(), 5)
+        self.assertGreater(len(tree_flatten(grad)), 0)
+
+        model = self._t5gemma2_model()
+        model.freeze()
+        tuner.utils.linear_to_lora_layers(
+            model,
+            1,
+            {
+                "rank": 2,
+                "dropout": 0.0,
+                "scale": 1.0,
+                "keys": ["self_attn.q_proj"],
+            },
+        )
+        (loss, toks), grad = nn.value_and_grad(model, seq2seq_loss)(
+            model,
+            source,
+            source_lengths,
+            target,
+            target_lengths,
+        )
+        mx.eval(loss, toks, grad)
+        self.assertTrue(bool(mx.isfinite(loss).item()))
+        self.assertEqual(toks.item(), 5)
+        self.assertTrue(
+            all("lora_" in name for name, _ in tree_flatten(model.trainable_parameters()))
+        )
+        self.assertGreater(len(tree_flatten(grad)), 0)
+
+    def test_t5gemma2_seq2seq_completions_batches(self):
+        from mlx_lm.tuner.datasets import CacheDataset, create_dataset
+
+        class Tokenizer:
+            eos_token_id = 1
+
+            def encode(self, text):
+                return [ord(c) % 31 + 2 for c in text]
+
+        dataset = create_dataset(
+            [
+                {"prompt": "a", "completion": "x"},
+                {"prompt": "bb", "completion": "yy"},
+            ],
+            Tokenizer(),
+            type("Config", (), {"is_encoder_decoder": True})(),
+        )
+        batch = next(
+            iterate_batches(
+                CacheDataset(dataset),
+                batch_size=2,
+                max_seq_length=16,
+            )
+        )
+
+        self.assertEqual(len(batch), 4)
+        source, source_lengths, target, target_lengths = batch
+        self.assertEqual(source.shape[0], 2)
+        self.assertEqual(target.shape[0], 2)
+        self.assertEqual(source_lengths.tolist(), [2, 3])
+        self.assertEqual(target_lengths.tolist(), [2, 3])
+
+    def test_t5gemma2_seq2seq_chat_preserves_tool_call_target(self):
+        from mlx_lm.tuner.datasets import create_dataset
+
+        class Tokenizer:
+            eos_token_id = 1
+
+            def encode(self, text):
+                return [ord(c) % 31 + 2 for c in text]
+
+            def apply_chat_template(
+                self,
+                messages,
+                tools=None,
+                add_generation_prompt=False,
+                return_dict=False,
+            ):
+                tokens = []
+                for message in messages:
+                    if message["role"] == "assistant" and message.get("tool_calls"):
+                        tokens.extend([50, 7])
+                    elif message["role"] == "assistant":
+                        tokens.extend([40, *self.encode(message.get("content", ""))])
+                    else:
+                        tokens.extend([30, *self.encode(message.get("content", ""))])
+                if tools:
+                    tokens.append(20)
+                if add_generation_prompt:
+                    tokens.append(10)
+                return tokens
+
+        sample = {
+            "messages": [
+                {"role": "user", "content": "weather"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Cupertino"}',
+                            },
+                        }
+                    ],
+                },
+            ],
+            "tools": [{"type": "function"}],
+        }
+        tokenizer = Tokenizer()
+        dataset = create_dataset(
+            [sample],
+            tokenizer,
+            type("Config", (), {"is_encoder_decoder": True})(),
+        )
+
+        source, target = dataset.process(sample)
+
+        self.assertEqual(
+            source,
+            tokenizer.apply_chat_template(
+                sample["messages"][:-1],
+                tools=sample["tools"],
+                add_generation_prompt=True,
+                return_dict=False,
+            ),
+        )
+        self.assertEqual(target, [50, 7, 20, 1])
 
     def test_gpt_neox(self):
         from mlx_lm.models import gpt_neox

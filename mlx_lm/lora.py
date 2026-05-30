@@ -14,9 +14,18 @@ import yaml
 
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
+from .tuner.trainer import (
+    TrainingArgs,
+    TrainingCallback,
+    default_loss,
+    evaluate,
+    seq2seq_loss,
+    train,
+)
 from .tuner.utils import (
     build_schedule,
+    get_tunable_layer_count,
+    get_tunable_layers,
     linear_to_lora_layers,
     load_adapters,
     print_trainable_parameters,
@@ -222,14 +231,15 @@ def train_model(
 ):
     mx.random.seed(args.seed)
     model.freeze()
-    if args.num_layers > len(model.layers):
+    if args.num_layers > get_tunable_layer_count(model):
         raise ValueError(
             f"Requested to train {args.num_layers} layers "
-            f"but the model only has {len(model.layers)} layers."
+            f"but the model only has {get_tunable_layer_count(model)} "
+            "tunable layers."
         )
 
     if args.fine_tune_type == "full":
-        for l in model.layers[-max(args.num_layers, 0) :]:
+        for l in get_tunable_layers(model, args.num_layers):
             l.unfreeze()
 
         args.lora_parameters = None
@@ -292,23 +302,27 @@ def train_model(
     opt = opt_class(learning_rate=lr, **optimizer_config)
 
     # Train model
+    loss = seq2seq_loss if getattr(model, "is_encoder_decoder", False) else default_loss
     train(
         model=model,
         args=training_args,
         optimizer=opt,
         train_dataset=CacheDataset(train_set),
         val_dataset=CacheDataset(valid_set),
+        loss=loss,
         training_callback=training_callback,
     )
 
 
 def evaluate_model(args, model: nn.Module, test_set):
+    loss = seq2seq_loss if getattr(model, "is_encoder_decoder", False) else default_loss
     test_loss = evaluate(
         model=model,
         dataset=CacheDataset(test_set),
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
+        loss=loss,
     )
 
     test_ppl = math.exp(test_loss)
@@ -327,6 +341,7 @@ def run(args, training_callback: TrainingCallback = None):
 
     print("Loading pretrained model")
     model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
+    args.is_encoder_decoder = getattr(model, "is_encoder_decoder", False)
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
